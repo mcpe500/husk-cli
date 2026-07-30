@@ -1,37 +1,100 @@
-# Husk-CLI: Agentic Proxy & Telemetry Specification
+# Husk-CLI: Graph-Native Code CLI & Multi-Agent Orchestration Specification
 Repository: github.com/mcpe500/husk-cli.git
 
+---
+
 ## 1. Executive Summary
-Husk-CLI operates as the primary agentic proxy and interaction layer for the system. Guided by an intentional minimalism aesthetic, it focuses on high-speed execution, multi-turn ReAct reasoning, and silent dataset harvesting. Crucially, Husk-CLI is the exclusive component that communicates with Large Language Models (LLMs) and actively queries the underlying Husk-RAG backend to fulfill user or systemic objectives.
 
-## 2. Model Integration & Abstraction
-The CLI is designed to dynamically route inference requests, strictly enforcing the separation of LLM logic from the storage backend.
-- **Primary Inference Engine**: Integration with gemma-4-31b-it via Google AI Studio for robust, high-parameter reasoning capabilities during the initial MVP phase.
-- **Compatibility Layer**: A native OpenAI-compatible API protocol implementation. This ensures drop-in replacement capabilities, allowing the system to seamlessly switch to other local or cloud endpoints without modifying the core proxy logic.
+Husk-CLI is a **Graph-Native, High-Performance Multi-Agent Coding CLI** built in **Rust**. Designed for minimal execution overhead, high memory safety, and cross-platform single-binary distribution, `husk-cli` decouples complex software engineering tasks into dynamic, graph-orchestrated micro-agent task graphs.
 
-## 3. Context Window Architecture (32k Standard)
-To prevent token overflow and context degradation, the CLI orchestrates a strict 32,000-token memory budget. The architecture relies on dynamic partitioning:
+By default, all software engineering tasks are executed across a **Looping Agent Execution Graph** composed of an Orchestrator Node at the top, Action/Dev Worker Agents, and Validation/QA Agents. Simultaneously, Husk-CLI indexes target repositories into a semantic **Codebase Graph** (AST, call graphs, import dependencies) to deliver targeted subgraph context for code generation.
 
-| Partition | Allocation Limit | Functional Responsibility |
-| :--- | :--- | :--- |
-| **Current Context** | 16k Tokens | Maintains the immediate multi-turn conversation, real-time ReAct scratchpad (thoughts/actions/observations), and system tool definitions. |
-| **Sliding Context** | 16k Tokens | Injects exact vectorized text chunks retrieved from Husk-RAG and manages auto-compacted summaries of older conversational turns. |
+Extensibility is built natively into `husk-cli` via Model Context Protocol (MCP) integrations, folder-based Skills, modular Plugins, event lifecycle Hooks, and built-in support for major model providers including **GLM Coding Plan Z.AI** and **MiniMax**.
 
-## 4. Multi-Turn ReAct Agent Workflow
-The CLI utilizes a Reason-Act-Observe loop to handle complex, multi-step operations (e.g., executing side projects). Following a "Show, Don't Tell" logging principle, internal states are clearly structured.
+---
 
-### [Workflow Sequence]
-1. **USER INSTRUCTION** -> Husk-CLI
-2. **CLI REASONING**    -> Analyzes if external context is needed.
-3. **CLI ACTION**       -> Queries Husk-RAG via /api/v1/query.
-4. **RAG RESPONSE**     -> Returns top-K chunks to CLI.
-5. **PROMPT ASSEMBLY**  -> CLI structures 32k context (Chunks + History + Prompts).
-6. **LLM CALL**         -> Dispatches prompt to Gemma 4 31b IT / OpenAI API.
-7. **OBSERVATION**      -> Evaluates LLM output, executes tools, or returns answer.
+## 2. Dual-Graph Paradigm
 
-## 5. Dataset Harvesting (Telemetry) Pipeline
-The proxy operates concurrently as a data aggregator. All multi-turn interactions, specifically the mapping of the context state to the chosen tool call and final output, are silently formatted and stored locally. This generates a high-resolution, organic dataset intended for the future fine-tuning of smaller, extensible architectures (e.g., LFM 2.5).
+Husk-CLI operates on two primary graph structures:
 
-## 6. Development & Deployment Methodology
-- **Engineering Cycle**: Execution utilizing the Spiral Model. The CLI proxy will be iteratively refined, testing LLM context stability and tool invocation accuracy at each loop.
-- **Environment Optimization**: Configured for deployment flexibility, prioritizing stable execution in local WSL2 environments and headless Ubuntu VPS setups.
+```
+                  ┌───────────────────────────────┐
+                  │    Codebase Graph (Context)   │
+                  │   [AST, Files, Call Graph]    │
+                  └──────────────┬────────────────┘
+                                 │ Subgraph Context
+                                 ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│               Looping Agent Execution Graph (Orchestration)            │
+│                                                                        │
+│                     ┌────────────────────────┐                         │
+│                     │   Orchestrator Agent   │ (Top Node)              │
+│                     └───────────┬────────────┘                         │
+│                                 │ Dispatches DAG                       │
+│                                 ▼                                      │
+│                     ┌────────────────────────┐                         │
+│             ┌──────►│  Dev / Action Worker   │                         │
+│             │       └───────────┬────────────┘                         │
+│             │                   │ Applies Code Changes                 │
+│    Loop Back│                   ▼                                      │
+│    Feedback │       ┌────────────────────────┐                         │
+│    with Logs│       │ Validation / QA Agent  │ (Real Commands)         │
+│             │       └───────────┬────────────┘                         │
+│             │                   │                                      │
+│             │  Fail / Error     │ Pass / 100% Tested                   │
+│             └───────────────────┴──────────┐                           │
+│                                            ▼                           │
+│                                       [Complete]                       │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Codebase Graph (Context Engine)**: Represents codebase structural and semantic topology. Nodes represent files, modules, classes, functions, and symbols, while edges capture imports, function invocations, inheritance, and data flow.
+2. **Agent Execution Graph (Orchestration Engine)**: A dynamic Directed Acyclic Graph (DAG) constructed per prompt with active **looping feedback edges** between Dev and Validation Agents.
+
+---
+
+## 3. Dynamic Looping Feedback & Anti-Cheating Protocol
+
+### A. Looping Execution Loop
+The execution graph does not stop after a single pass. It iterates continuously:
+1. **Dev / Action Agent**: Generates and writes actual code modifications to local workspace files.
+2. **Validation / QA Agent**: Executes real terminal checks (`cargo test`, static linters, syntax checks, build scripts).
+3. **Loop Evaluation**:
+   - If tests/checks **FAIL** or are incomplete: A feedback edge routes the exact stdout/stderr traceback back to the Dev Agent, starting **Loop $N+1$**.
+   - If tests/checks **PASS 100%**: Execution terminates with a success status.
+   - Max iteration guard: Enforces `--max-retries` (default: 5) to prevent infinite loops on unresolvable bugs.
+
+### B. Anti-Cheating Verification Rules
+- **No Mocking or Hardcoded Fallbacks**: Validation Agents MUST execute actual system tools and inspect true exit codes.
+- **Persistent Disk Verification**: Dev Agents MUST write modifications to disk before triggering validation.
+- **Traceback Preservation**: Every failed iteration appends historical error context to the next iteration prompt so the Dev Agent learns from previous failed attempts.
+
+---
+
+## 4. Codebase Graph Indexing Engine
+
+The CLI provides native indexing capabilities to translate local code repositories into a queryable Codebase Graph stored at `.husk/graph.json`.
+
+---
+
+## 5. Model Integration & Provider Ecosystem
+
+`husk-cli` supports modular LLM provider integration with first-class preset support for **GLM Coding Plan Z.AI**, **MiniMax**, **OpenAI**, and **Anthropic**.
+
+| Provider Preset | Protocol | Default Base URL | Default Model ID |
+| :--- | :--- | :--- | :--- |
+| `zai` / `glm-anthropic` | Anthropic Messages | `https://api.z.ai/api/anthropic` | `glm-4` |
+| `zai-openai` / `glm-openai` | OpenAI Chat | `https://api.z.ai/api/coding/paas/v4` | `glm-4` |
+| `minimax` / `minimax-openai` | OpenAI Compatible | `https://api.minimax.io/v1` | `MiniMax-M3` |
+| `minimax-anthropic` | Anthropic Compatible | `https://api.minimax.io/anthropic` | `MiniMax-M3` |
+| `openai` | OpenAI Chat | `https://api.openai.com/v1` | `gpt-4o` |
+| `anthropic` | Anthropic Messages | `https://api.anthropic.com/v1` | `claude-3-5-sonnet-20241022` |
+
+---
+
+## 6. CLI Commands Reference
+
+```bash
+# Run multi-agent execution workflow with looping QA loop
+husk run "<prompt>" [--provider <provider>] [--max-retries <n>]
+```
