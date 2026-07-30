@@ -1,5 +1,4 @@
 use anyhow::Result;
-use colored::Colorize;
 use crate::graph::execution::{ExecutionGraph, NodeStatus};
 use crate::providers::LlmProvider;
 use std::process::Command;
@@ -43,7 +42,6 @@ impl AgentOrchestrator {
         };
 
         emit(ExecutionEvent::Log("▶ Launching Multi-Agent Execution Graph...".to_string()));
-        println!("{}", "▶ Launching Multi-Agent Execution Graph...".bold().cyan());
 
         // Step 1: Run Orchestrator Node (Node 0)
         let orchestrator_node = &mut graph.nodes[0];
@@ -54,8 +52,7 @@ impl AgentOrchestrator {
         });
 
         let msg = format!("⚡ Executing Node [{:?}] {}", orchestrator_node.role, orchestrator_node.id);
-        emit(ExecutionEvent::Log(msg.clone()));
-        println!("{}", msg.yellow());
+        emit(ExecutionEvent::Log(msg));
 
         let plan_resp = self
             .provider
@@ -67,14 +64,12 @@ impl AgentOrchestrator {
 
         emit(ExecutionEvent::OrchestratorThought(plan_resp.clone()));
         emit(ExecutionEvent::Log(format!("Orchestrator Plan:\n{}", plan_resp.trim())));
-        println!("   {} {}", "Orchestrator Plan:".dimmed(), plan_resp.trim());
 
         orchestrator_node.status = NodeStatus::Success;
         emit(ExecutionEvent::NodeStatusChanged {
             node_idx: 0,
             status: "PASSED".to_string(),
         });
-        println!("   {}", "✔ Orchestrator Plan Ready".green());
 
         // Step 2: Active Looping Loop between Dev Agent and Validation Agent
         let mut iteration = 1;
@@ -88,8 +83,7 @@ impl AgentOrchestrator {
             });
 
             let loop_header = format!("🔄 --- LOOP ITERATION {}/{} ---", iteration, graph.max_retries);
-            emit(ExecutionEvent::Log(loop_header.clone()));
-            println!("\n{}", loop_header.bold().blue());
+            emit(ExecutionEvent::Log(loop_header));
 
             // Dev/Action Agent Node Execution
             let dev_node = &mut graph.nodes[1];
@@ -100,8 +94,7 @@ impl AgentOrchestrator {
             });
 
             let dev_msg = format!("⚡ Executing Node [{:?}] {}", dev_node.role, dev_node.id);
-            emit(ExecutionEvent::Log(dev_msg.clone()));
-            println!("{}", dev_msg.yellow());
+            emit(ExecutionEvent::Log(dev_msg));
 
             let mut dev_prompt = dev_node.instruction.clone();
             if let Some(ref error_log) = last_error_traceback {
@@ -122,7 +115,6 @@ impl AgentOrchestrator {
 
             emit(ExecutionEvent::DevAgentThought(dev_resp.clone()));
             emit(ExecutionEvent::Log(format!("Dev Action Output:\n{}", dev_resp.trim())));
-            println!("   {} {}", "Dev Agent Action:".dimmed(), dev_resp.trim());
             dev_node.status = NodeStatus::Success;
 
             // Validation / QA Agent Node Execution (Anti-Cheating Real Tool Check)
@@ -134,11 +126,9 @@ impl AgentOrchestrator {
             });
 
             let val_msg = format!("⚡ Executing Node [{:?}] {}", val_node.role, val_node.id);
-            emit(ExecutionEvent::Log(val_msg.clone()));
-            println!("{}", val_msg.yellow());
+            emit(ExecutionEvent::Log(val_msg));
 
             emit(ExecutionEvent::Log("🔍 Running anti-cheating real tool validation (cargo check)...".to_string()));
-            println!("   {}", "🔍 Running anti-cheating real tool validation (cargo check)...".cyan());
 
             let test_output = Command::new("cargo")
                 .arg("check")
@@ -152,8 +142,6 @@ impl AgentOrchestrator {
                     let combined_err = format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr);
                     let err_msg = format!("❌ Validation Check Failed! Errors detected:\n{}", combined_err);
                     emit(ExecutionEvent::Log(err_msg));
-                    println!("   {}", "❌ Validation Check Failed! Errors detected in codebase.".red().bold());
-                    println!("   {}", combined_err.lines().next().unwrap_or("Error detected"));
                     last_error_traceback = Some(combined_err);
                     false
                 }
@@ -187,9 +175,7 @@ impl AgentOrchestrator {
                     status: "PASSED".to_string(),
                 });
                 let pass_msg = format!("✔ Validation Passed 100% on Iteration {}!", iteration);
-                emit(ExecutionEvent::Log(pass_msg.clone()));
-                println!("   {}", pass_msg.green().bold());
-                println!("\n{}", "✔ Agent Execution Graph Finished Successfully!".green().bold());
+                emit(ExecutionEvent::Log(pass_msg));
                 emit(ExecutionEvent::Finished { success: true });
                 return Ok(true);
             } else {
@@ -202,17 +188,15 @@ impl AgentOrchestrator {
                     status: format!("REPAIRING LOOP {}", iteration),
                 });
                 let retry_msg = "⚠️ Validation failed. Triggering Feedback Loop to Dev Agent...".to_string();
-                emit(ExecutionEvent::Log(retry_msg.clone()));
-                println!("   {}", retry_msg.yellow());
+                emit(ExecutionEvent::Log(retry_msg));
             }
 
             iteration += 1;
         }
 
         let fail_msg = format!("❌ Execution Graph failed after {} iterations.", graph.max_retries);
-        emit(ExecutionEvent::Log(fail_msg.clone()));
+        emit(ExecutionEvent::Log(fail_msg));
         emit(ExecutionEvent::Finished { success: false });
-        println!("\n{}", fail_msg.red().bold());
         Ok(false)
     }
 }
