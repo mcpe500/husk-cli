@@ -1,59 +1,40 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::anthropic::AnthropicProvider;
 use super::openai::OpenAiProvider;
 use super::LlmProvider;
-
-pub enum MiniMaxProtocol {
-    OpenAi(OpenAiProvider),
-    Anthropic(AnthropicProvider),
-}
+use crate::config::Config;
 
 pub struct MiniMaxProvider {
-    inner: MiniMaxProtocol,
+    inner: Box<dyn LlmProvider>,
 }
 
 impl MiniMaxProvider {
-    pub fn new_openai(api_key: String, base_url: String, model: String, max_tokens: usize) -> Self {
-        let url = if base_url.is_empty() {
-            "https://api.minimax.io/v1".to_string()
+    pub fn new(config: Config) -> Self {
+        let is_anthropic = config.base_url.contains("anthropic");
+        let inner: Box<dyn LlmProvider> = if is_anthropic {
+            Box::new(AnthropicProvider::new(config.clone()))
         } else {
-            base_url
+            Box::new(OpenAiProvider::new(config.clone()))
         };
-        let m = if model.is_empty() {
-            "MiniMax-M3".to_string()
-        } else {
-            model
-        };
-        Self {
-            inner: MiniMaxProtocol::OpenAi(OpenAiProvider::new(api_key, url, m, max_tokens)),
-        }
-    }
-
-    pub fn new_anthropic(api_key: String, base_url: String, model: String, max_tokens: usize) -> Self {
-        let url = if base_url.is_empty() {
-            "https://api.minimax.io/anthropic".to_string()
-        } else {
-            base_url
-        };
-        let m = if model.is_empty() {
-            "MiniMax-M3".to_string()
-        } else {
-            model
-        };
-        Self {
-            inner: MiniMaxProtocol::Anthropic(AnthropicProvider::new(api_key, url, m, max_tokens)),
-        }
+        Self { inner }
     }
 }
 
 #[async_trait]
 impl LlmProvider for MiniMaxProvider {
     async fn completion(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
-        match &self.inner {
-            MiniMaxProtocol::OpenAi(p) => p.completion(system_prompt, user_prompt).await,
-            MiniMaxProtocol::Anthropic(p) => p.completion(system_prompt, user_prompt).await,
-        }
+        self.inner.completion(system_prompt, user_prompt).await
+    }
+
+    async fn stream_completion(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        token_tx: UnboundedSender<String>,
+    ) -> Result<String> {
+        self.inner.stream_completion(system_prompt, user_prompt, token_tx).await
     }
 }

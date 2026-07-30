@@ -2,12 +2,13 @@ use anyhow::Result;
 use crate::graph::execution::{ExecutionGraph, NodeStatus};
 use crate::providers::LlmProvider;
 use std::process::Command;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
     Log(String),
+    TokenStream(String),
     NodeStatusChanged { node_idx: usize, status: String },
     OrchestratorThought(String),
     DevAgentThought(String),
@@ -54,11 +55,23 @@ impl AgentOrchestrator {
         let msg = format!("⚡ Executing Node [{:?}] {}", orchestrator_node.role, orchestrator_node.id);
         emit(ExecutionEvent::Log(msg));
 
+        let (token_tx, mut token_rx) = unbounded_channel::<String>();
+        let emit_tx = tx.clone();
+
+        tokio::spawn(async move {
+            while let Some(chunk) = token_rx.recv().await {
+                if let Some(ref sender) = emit_tx {
+                    let _ = sender.send(ExecutionEvent::TokenStream(chunk));
+                }
+            }
+        });
+
         let plan_resp = self
             .provider
-            .completion(
+            .stream_completion(
                 "You are Husk-CLI Orchestrator. Formulate a step-by-step dev and test plan.",
                 &orchestrator_node.instruction,
+                token_tx.clone(),
             )
             .await?;
 
@@ -107,9 +120,10 @@ impl AgentOrchestrator {
 
             let dev_resp = self
                 .provider
-                .completion(
+                .stream_completion(
                     "You are Husk-CLI Dev/Action Agent. Write complete code and fix all reported errors without cheating.",
                     &dev_prompt,
+                    token_tx.clone(),
                 )
                 .await?;
 
@@ -148,9 +162,10 @@ impl AgentOrchestrator {
                 Err(_err) => {
                     let val_resp = self
                         .provider
-                        .completion(
+                        .stream_completion(
                             "You are Husk-CLI Validation Agent. Evaluate code syntax and verify if execution goal is met. Output PASS or FAIL.",
                             &format!("Goal: {}\nDev Output: {}", dev_prompt, dev_resp),
+                            token_tx.clone(),
                         )
                         .await?;
                     emit(ExecutionEvent::ValidationThought(val_resp.clone()));

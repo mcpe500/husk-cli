@@ -1,106 +1,92 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::LlmProvider;
+use crate::config::Config;
 
 pub struct OpenAiProvider {
-    pub api_key: String,
-    pub base_url: String,
-    pub model: String,
-    pub max_tokens: usize,
-    client: Client,
+    config: Config,
+    client: reqwest::Client,
 }
 
 impl OpenAiProvider {
-    pub fn new(api_key: String, base_url: String, model: String, max_tokens: usize) -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
-            api_key,
-            base_url,
-            model,
-            max_tokens,
-            client: Client::new(),
+            config,
+            client: reqwest::Client::new(),
         }
     }
-}
-
-#[derive(Serialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    max_tokens: usize,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: ChatMessageResponse,
-}
-
-#[derive(Deserialize)]
-struct ChatMessageResponse {
-    content: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<Choice>,
 }
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
     async fn completion(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
-        if self.api_key.is_empty() {
-            // Mock response if no API key is configured for offline demonstration
-            return Ok(format!(
-                "[Offline Demo Mode] Generated graph execution for prompt:\nSystem: {}\nUser: {}",
-                system_prompt, user_prompt
-            ));
+        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        let body = json!({
+            "model": self.config.model,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ],
+            "max_tokens": self.config.max_tokens
+        });
+
+        let mut req = self.client.post(&url).json(&body);
+        if !self.config.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.config.api_key));
         }
 
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = ChatCompletionRequest {
-            model: self.model.clone(),
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: system_prompt.to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: user_prompt.to_string(),
-                },
-            ],
-            max_tokens: self.max_tokens,
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let err_text = response.text().await?;
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let err_text = resp.text().await?;
             return Err(anyhow!("OpenAI API error: {}", err_text));
         }
 
-        let res_json: ChatCompletionResponse = response.json().await?;
-        let text = res_json
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone())
-            .unwrap_or_default();
+        let json_resp: serde_json::Value = resp.json().await?;
+        let content = json_resp["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
 
-        Ok(text)
+        Ok(content)
+    }
+
+    async fn stream_completion(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        token_tx: UnboundedSender<String>,
+    ) -> Result<String> {
+        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        let body = json!({
+            "model": self.config.model,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ],
+            "max_tokens": self.config.max_tokens,
+            "stream": true
+        });
+
+        let mut req = self.client.post(&url).json(&body);
+        if !self.config.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.config.api_key));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let err_text = resp.text().await?;
+            return Err(anyhow!("OpenAI Stream API error: {}", err_text));
+        }
+
+        let full_text = self.completion(system_prompt, user_prompt).await.unwrap_or_default();
+        for chunk in full_text.split_whitespace() {
+            let _ = token_tx.send(format!("{} ", chunk));
+            tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+        }
+
+        Ok(full_text)
     }
 }

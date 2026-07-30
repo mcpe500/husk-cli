@@ -116,10 +116,29 @@ pub fn run_tui() -> Result<()> {
     let mut start_time = Instant::now();
 
     loop {
+        // Update live duration timer during active execution
+        if is_running {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            if let Some(last_msg) = messages.last_mut() {
+                if !last_msg.is_user {
+                    last_msg.duration_secs = elapsed;
+                }
+            }
+        }
+
         // Drain events from MPSC channel
         if let Some(ref mut rx) = rx_channel {
             while let Ok(evt) = rx.try_recv() {
                 match evt {
+                    ExecutionEvent::TokenStream(chunk) => {
+                        let token_count = chunk.split_whitespace().count().max(1);
+                        total_tokens_used += token_count;
+                        if let Some(last_msg) = messages.last_mut() {
+                            if !last_msg.is_user {
+                                last_msg.content.push_str(&chunk);
+                            }
+                        }
+                    }
                     ExecutionEvent::Log(text) => {
                         if text.contains("<!DOCTYPE html>") || text.contains("fn main()") || text.contains("code") {
                             current_code_snippet = Some(("hello.html".to_string(), text.clone()));
@@ -157,19 +176,24 @@ pub fn run_tui() -> Result<()> {
                     ExecutionEvent::Finished { success } => {
                         is_running = false;
                         let elapsed = start_time.elapsed().as_secs_f64();
-                        let ai_response = if success {
-                            "Created hello.html with a \"Hello World\" page.".to_string()
-                        } else {
-                            "Execution finished with validation errors.".to_string()
-                        };
-                        messages.push(ChatMessage {
-                            is_user: false,
-                            content: ai_response,
-                            thought: current_thinking.take(),
-                            code_snippet: current_code_snippet.take(),
-                            duration_secs: elapsed,
-                        });
-                        total_tokens_used += 123;
+                        if let Some(last_msg) = messages.last_mut() {
+                            if !last_msg.is_user {
+                                last_msg.duration_secs = elapsed;
+                                if last_msg.content.is_empty() {
+                                    last_msg.content = if success {
+                                        "Created hello.html with a \"Hello World\" page.".to_string()
+                                    } else {
+                                        "Execution finished with validation errors.".to_string()
+                                    };
+                                }
+                                if last_msg.thought.is_none() {
+                                    last_msg.thought = current_thinking.take();
+                                }
+                                if last_msg.code_snippet.is_none() {
+                                    last_msg.code_snippet = current_code_snippet.take();
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -300,10 +324,6 @@ pub fn run_tui() -> Result<()> {
                     formatted_chat.push(Line::from(""));
                 }
 
-                if is_running {
-                    formatted_chat.push(Line::from(Span::styled("+ Thought: running...", Style::default().fg(Color::Yellow))));
-                }
-
                 let chat_p = Paragraph::new(formatted_chat)
                     .wrap(Wrap { trim: false })
                     .style(Style::default().fg(Color::White));
@@ -348,11 +368,11 @@ pub fn run_tui() -> Result<()> {
                 f.render_widget(title_p, sidebar_layout[0]);
 
                 // 2. Token Gauge & Cost Block
-                let context_percent = (total_tokens_used as f64 / 128000.0 * 100.0) as usize;
+                let context_percent = ((total_tokens_used as f64 / 128000.0) * 100.0) as usize;
                 let gauge_ratio = (total_tokens_used as f64 / 128000.0).min(1.0);
                 
                 let token_gauge = Gauge::default()
-                    .block(Block::default().title(format!(" Context ({:.1}%) ", context_percent)).style(Style::default().fg(Color::DarkGray)))
+                    .block(Block::default().title(format!(" Context ({}%) ", context_percent)).style(Style::default().fg(Color::DarkGray)))
                     .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 35)))
                     .ratio(gauge_ratio)
                     .label(format!("{} / 128K", format_tokens(total_tokens_used)));
@@ -431,7 +451,7 @@ pub fn run_tui() -> Result<()> {
                 .style(Style::default().fg(Color::DarkGray));
             f.render_widget(cwd_p, footer_layout[0]);
 
-            let right_status = format!("{:.1}K (1%)   ctrl+p commands", total_tokens_used as f64 / 1000.0);
+            let right_status = format!("{:.1}K ({}%)   ctrl+p commands", total_tokens_used as f64 / 1000.0, (total_tokens_used as f64 / 128000.0 * 100.0) as usize);
             let right_p = Paragraph::new(right_status)
                 .alignment(Alignment::Right)
                 .style(Style::default().fg(Color::DarkGray));
@@ -924,12 +944,24 @@ pub fn run_tui() -> Result<()> {
                             }
 
                             // Regular Prompt Submission
+                            let input_tokens = (input.len() / 4).max(5);
+                            total_tokens_used += input_tokens;
+
                             messages.push(ChatMessage {
                                 is_user: true,
                                 content: input.clone(),
                                 thought: None,
                                 code_snippet: None,
                                 duration_secs: 0.0,
+                            });
+
+                            // Prepare empty AI message slot for word-by-word streaming
+                            messages.push(ChatMessage {
+                                is_user: false,
+                                content: String::new(),
+                                thought: Some("Thought: running...".to_string()),
+                                code_snippet: None,
+                                duration_secs: 0.1,
                             });
 
                             is_running = true;
