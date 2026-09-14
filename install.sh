@@ -13,19 +13,29 @@ case "$(uname -s)-$(uname -m)" in
         asset="husk-cli-x86_64-unknown-linux-gnu.tar.gz"
         bin="husk-cli"
         ;;
-    Darwin-arm64|Darwin-x86_64|Linux-aarch64)
-        echo "no prebuilt binary for $(uname -s)-$(uname -m)."
-        echo "build from source instead:"
+    Linux-aarch64|Linux-arm64)
+        asset="husk-cli-aarch64-unknown-linux-gnu.tar.gz"
+        bin="husk-cli"
+        ;;
+    Darwin-arm64)
+        asset="husk-cli-aarch64-apple-darwin.tar.gz"
+        bin="husk-cli"
+        ;;
+    Darwin-x86_64)
+        echo "no prebuilt binary for Intel macOS; build from source:"
         echo "  cargo install --git https://github.com/$repo.git"
         exit 1
         ;;
     MINGW*|MSYS*|CYGWIN*)
         echo "on Windows, download from https://github.com/$repo/releases/latest"
-        echo "  asset: husk-cli-x86_64-pc-windows-msvc.zip"
+        echo "  Win10/11: husk-cli-x86_64-pc-windows-msvc.zip"
+        echo "  Win7/8  : husk-cli-x86_64-pc-windows-win7.zip (cloud-only)"
         exit 1
         ;;
     *)
         echo "unsupported platform: $(uname -s)-$(uname -m)"
+        echo "on Termux/Android build natively instead:"
+        echo "  pkg install rust && cargo install --git https://github.com/$repo.git"
         exit 1
         ;;
 esac

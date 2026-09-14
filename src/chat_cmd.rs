@@ -15,6 +15,10 @@ use crate::local;
 use crate::providers::create_provider;
 
 fn run_shell(command: &str) -> Option<String> {
+    // cmd.exe is guaranteed on Windows 7+; POSIX sh everywhere else.
+    #[cfg(windows)]
+    let output = std::process::Command::new("cmd").args(["/C", command]).output().ok()?;
+    #[cfg(not(windows))]
     let output = std::process::Command::new("sh").arg("-c").arg(command).output().ok()?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     let err = String::from_utf8_lossy(&output.stderr);

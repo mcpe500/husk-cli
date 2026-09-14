@@ -52,6 +52,30 @@ husk config set api_key "$NETRA_API_KEY"
 husk chat
 ```
 
+### Platform support
+
+| Platform | Install | Local MiniCPM worker | Notes |
+|---|---|---|---|
+| **Linux x86_64** (this repo's dev target) | install.sh / cargo | ✅ `--features local` (+`vulkan` for iGPU) | full support |
+| **Linux ARM64** (RPi, ARM servers) | install.sh (aarch64 asset) / cargo | ✅ `--features local` (NEON) | native CI builds |
+| **Windows 10 / 11** | `husk-cli-x86_64-pc-windows-msvc.zip` from Releases | ✅ build locally with `--features local` (+ Vulkan SDK) | TUI + ANSI OK |
+| **Windows 7 / 8.1** | `husk-cli-x86_64-pc-windows-win7.zip` (cloud-only) | ❌ | plain-console build (`x86_64-win7-windows-msvc`); set `NO_COLOR=1` if colors look garbled; prefer `husk chat` over the TUI |
+| **Termux / Android (aarch64)** | build natively in Termux (below) | ✅ on-device build | bionic libc — glibc prebuilts do NOT run; build inside Termux |
+| **macOS Apple Silicon** | install.sh (aarch64-apple-darwin asset) | build locally with `--features local` | |
+
+**Termux (Android):**
+
+```bash
+pkg update && pkg install rust clang binutils
+cargo install --git https://github.com/mcpe500/husk-cli.git
+# with the local worker (llama.cpp runs on ARM NEON):
+pkg install cmake && cargo install --git https://github.com/mcpe500/husk-cli.git --features local
+```
+
+**Windows 7/8.1 caveats:** the win7 build ships cloud-only (TLS stack and
+llama.cpp toolchains are the blockers). `!cmd` prefixes run through
+`cmd.exe`; ANSI styling needs `NO_COLOR=1` on the legacy conhost.
+
 ---
 
 ## Architecture

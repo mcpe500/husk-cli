@@ -3,6 +3,8 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Validate builds without cutting a release: gh workflow run release.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,6 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # --- Linux x86_64 (dev machines, this repo's main target) ---
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: ""
@@ -22,10 +25,29 @@ jobs:
             target: x86_64-unknown-linux-gnu
             features: "local"
             suffix: "-local"
+
+          # --- Linux ARM64 (RPi, ARM servers) ---
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            features: ""
+            suffix: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            features: "local"
+            suffix: "-local"
+
+          # --- macOS ARM64 (Apple Silicon) ---
+          - os: macos-14
+            target: aarch64-apple-darwin
+            features: ""
+            suffix: ""
+
+          # --- Windows 10/11 (MSVC) ---
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             features: ""
             suffix: ""
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -38,14 +60,14 @@ jobs:
         shell: bash
         env:
           FEATURES: ${{ matrix.features }}
-        run: cargo build --release --locked ${FEATURES:+--features $FEATURES}
+        run: cargo build --release --locked --target ${{ matrix.target }} ${FEATURES:+--features $FEATURES}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           asset="husk-cli-${{ matrix.target }}${{ matrix.suffix }}.tar.gz"
-          tar -czf "$asset" -C target/release husk-cli
+          tar -czf "$asset" -C target/${{ matrix.target }}/release husk-cli
           echo "asset=$asset" >> "$GITHUB_ENV"
 
       - name: Package (windows)
@@ -53,10 +75,43 @@ jobs:
         shell: pwsh
         run: |
           $asset = "husk-cli-${{ matrix.target }}${{ matrix.suffix }}.zip"
-          Compress-Archive -Path target/release/husk-cli.exe -DestinationPath $asset
+          Compress-Archive -Path target/${{ matrix.target }}/release/husk-cli.exe -DestinationPath $asset
           "asset=$asset" | Add-Content $env:GITHUB_ENV
 
       - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.asset }}
+          generate_release_notes: true
+
+  # Windows 7/8.1 support: tier-3 win7 target, cloud-only (no llama.cpp).
+  # Builds a binary that runs on the Win7/8 conhost; styling is plain.
+  build-win7:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build for Windows 7/8.1 (x86_64-win7-windows-msvc)
+        shell: bash
+        # build-std compiles std from source; --locked is not applicable.
+        run: cargo +nightly build --release -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $asset = "husk-cli-x86_64-pc-windows-win7.zip"
+          Compress-Archive -Path target/x86_64-win7-windows-msvc/release/husk-cli.exe -DestinationPath $asset
+          "asset=$asset" | Add-Content $env:GITHUB_ENV
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.asset }}
