@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "husk", author = "Husk Team", version = "0.2.0", about = "Token-cheap agentic coding harness: DeepSeek supervisor + embedded MiniCPM context worker")]
+#[command(name = "husk", author = "Husk Team", version = "0.2.1", about = "Token-cheap agentic coding harness: DeepSeek supervisor + embedded MiniCPM context worker")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
