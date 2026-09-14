@@ -1,17 +1,32 @@
+// The binary compiles the library modules directly (single-crate layout).
+// Part of that surface is exercised by the lib target's test suite rather
+// than the binary itself, so bin-side dead-code warnings are silenced.
+#![allow(dead_code)]
+
 mod agents;
+mod chat_cmd;
 mod cli;
+mod compress;
 mod config;
+mod context;
+mod db;
 mod graph;
+mod local;
+mod local_cmd;
 mod mcp;
 mod plugins;
 mod providers;
+mod router;
+mod sessions_cmd;
+mod stats_cmd;
 mod telemetry;
+mod tokenutil;
 mod tui;
+mod verify;
 
 use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
-use std::path::PathBuf;
 
 use agents::AgentOrchestrator;
 use cli::{Cli, Commands, ConfigCommands, McpCommands, PluginCommands, SkillCommands};
@@ -37,9 +52,29 @@ async fn main() -> Result<()> {
             run_tui()?;
         }
 
+        Commands::Chat { prompt, session, local, files } => {
+            crate::chat_cmd::run(&mut config, prompt, session, local, files).await?;
+        }
+
+        Commands::Sessions { action } => {
+            crate::sessions_cmd::run(action)?;
+        }
+
+        Commands::Stats { session } => {
+            crate::stats_cmd::run(&session)?;
+        }
+
+        Commands::Search { query, limit } => {
+            crate::sessions_cmd::run_search(&query, limit)?;
+        }
+
+        Commands::Local { action } => {
+            crate::local_cmd::run(&config, action)?;
+        }
+
         Commands::Index { path, force } => {
             println!("{}", "▶ Indexing Codebase into Graph...".bold().cyan());
-            let target_path = if path == PathBuf::from(".") {
+            let target_path = if path.as_os_str() == "." {
                 std::env::current_dir()?
             } else {
                 path
@@ -84,6 +119,7 @@ async fn main() -> Result<()> {
                     "minimax-anthropic" => config.apply_preset(ProviderPreset::MiniMaxAnthropic),
                     "openai" => config.apply_preset(ProviderPreset::OpenAi),
                     "anthropic" => config.apply_preset(ProviderPreset::Anthropic),
+                    "deepseek" | "netra" => config.apply_preset(ProviderPreset::Deepseek),
                     _ => {}
                 }
             }
@@ -210,6 +246,7 @@ async fn main() -> Result<()> {
                     "minimax-anthropic" => config.apply_preset(ProviderPreset::MiniMaxAnthropic),
                     "openai" => config.apply_preset(ProviderPreset::OpenAi),
                     "anthropic" => config.apply_preset(ProviderPreset::Anthropic),
+                    "deepseek" | "netra" => config.apply_preset(ProviderPreset::Deepseek),
                     _ => println!("Unknown preset: {}", name),
                 }
                 config.save()?;

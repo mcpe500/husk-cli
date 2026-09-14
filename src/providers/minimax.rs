@@ -4,7 +4,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::anthropic::AnthropicProvider;
 use super::openai::OpenAiProvider;
-use super::LlmProvider;
+use super::{ChatRequest, ChatResponse, LlmProvider};
 use crate::config::Config;
 
 pub struct MiniMaxProvider {
@@ -13,11 +13,10 @@ pub struct MiniMaxProvider {
 
 impl MiniMaxProvider {
     pub fn new(config: Config) -> Self {
-        let is_anthropic = config.base_url.contains("anthropic");
-        let inner: Box<dyn LlmProvider> = if is_anthropic {
-            Box::new(AnthropicProvider::new(config.clone()))
+        let inner: Box<dyn LlmProvider> = if config.base_url.contains("anthropic") {
+            Box::new(AnthropicProvider::new(config))
         } else {
-            Box::new(OpenAiProvider::new(config.clone()))
+            Box::new(OpenAiProvider::new(config))
         };
         Self { inner }
     }
@@ -25,16 +24,24 @@ impl MiniMaxProvider {
 
 #[async_trait]
 impl LlmProvider for MiniMaxProvider {
-    async fn completion(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
-        self.inner.completion(system_prompt, user_prompt).await
+    async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+        self.inner.chat(req).await
     }
 
-    async fn stream_completion(
+    async fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        token_tx: UnboundedSender<String>,
+    ) -> Result<ChatResponse> {
+        self.inner.chat_stream(req, token_tx).await
+    }
+
+    async fn chat_simple(
         &self,
         system_prompt: &str,
         user_prompt: &str,
-        token_tx: UnboundedSender<String>,
-    ) -> Result<String> {
-        self.inner.stream_completion(system_prompt, user_prompt, token_tx).await
+        token_tx: Option<UnboundedSender<String>>,
+    ) -> Result<ChatResponse> {
+        self.inner.chat_simple(system_prompt, user_prompt, token_tx).await
     }
 }

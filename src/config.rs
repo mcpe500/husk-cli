@@ -17,6 +17,8 @@ pub enum ProviderPreset {
     OpenAi,
     #[serde(rename = "anthropic")]
     Anthropic,
+    #[serde(rename = "deepseek")]
+    Deepseek,
     #[serde(rename = "custom")]
     Custom,
 }
@@ -42,17 +44,23 @@ pub struct Config {
     pub model: String,
     pub max_tokens: usize,
     pub telemetry_enabled: bool,
+    /// Local embedded MiniCPM worker. Off by default: cloud-only startup,
+    /// zero model RAM unless explicitly enabled.
+    #[serde(default)]
+    pub local: crate::local::LocalConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            provider: ProviderPreset::ZaiOpenAi,
+            // DeepSeek via Netra Runtime is the harness's primary supervisor.
+            provider: ProviderPreset::Deepseek,
             api_key: String::new(),
-            base_url: "https://api.z.ai/api/coding/paas/v4".to_string(),
-            model: "glm-5.2".to_string(),
+            base_url: "https://api.netraruntime.com/v1".to_string(),
+            model: "deepseek/deepseek-v4-flash-0731".to_string(),
             max_tokens: 4096,
             telemetry_enabled: true,
+            local: crate::local::LocalConfig::default(),
         }
     }
 }
@@ -67,6 +75,13 @@ impl Config {
     pub fn config_path() -> PathBuf {
         let mut path = Self::husk_dir();
         path.push("config.toml");
+        path
+    }
+
+    /// Session history database — the husk.db analog of opencode.db.
+    pub fn db_path() -> PathBuf {
+        let mut path = Self::husk_dir();
+        path.push("husk.db");
         path
     }
 
@@ -107,7 +122,8 @@ impl Config {
         match preset {
             ProviderPreset::ZaiAnthropic => {
                 self.base_url = "https://api.z.ai/api/anthropic".to_string();
-                self.model = "glm-4".to_string();
+                // glm-4 has been retired by Z.AI; glm-5.2 is a verified current model.
+                self.model = "glm-5.2".to_string();
             }
             ProviderPreset::ZaiOpenAi => {
                 self.base_url = "https://api.z.ai/api/coding/paas/v4".to_string();
@@ -128,6 +144,12 @@ impl Config {
             ProviderPreset::Anthropic => {
                 self.base_url = "https://api.anthropic.com/v1".to_string();
                 self.model = "claude-3-5-sonnet".to_string();
+            }
+            ProviderPreset::Deepseek => {
+                // Netra Runtime (user's provider): OpenAI-compatible,
+                // reasoning via {"enabled","effort","exclude"} object.
+                self.base_url = "https://api.netraruntime.com/v1".to_string();
+                self.model = "deepseek/deepseek-v4-flash-0731".to_string();
             }
             ProviderPreset::Custom => {}
         }

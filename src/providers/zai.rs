@@ -1,103 +1,50 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::LlmProvider;
+use super::anthropic::AnthropicProvider;
+use super::openai::OpenAiProvider;
+use super::{ChatRequest, ChatResponse, LlmProvider};
 use crate::config::Config;
 
+/// Z.AI GLM provider. Routes by base_url protocol: `.../anthropic` speaks
+/// Anthropic Messages, everything else speaks OpenAI-compatible chat.
+/// Model IDs verified live: `glm-4` is retired; use `glm-5.2`/`glm-5.3`.
 pub struct ZaiProvider {
-    config: Config,
-    client: reqwest::Client,
+    inner: Box<dyn LlmProvider>,
 }
 
 impl ZaiProvider {
     pub fn new(config: Config) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        let inner: Box<dyn LlmProvider> = if config.base_url.contains("anthropic") {
+            Box::new(AnthropicProvider::new(config))
+        } else {
+            Box::new(OpenAiProvider::new(config))
+        };
+        Self { inner }
     }
 }
 
 #[async_trait]
 impl LlmProvider for ZaiProvider {
-    async fn completion(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
-        let is_anthropic = self.config.base_url.contains("anthropic");
-
-        if is_anthropic {
-            let url = format!("{}/messages", self.config.base_url.trim_end_matches('/'));
-            let body = json!({
-                "model": self.config.model,
-                "system": system_prompt,
-                "messages": [
-                    { "role": "user", "content": user_prompt }
-                ],
-                "max_tokens": self.config.max_tokens
-            });
-
-            let mut req = self.client.post(&url).json(&body);
-            if !self.config.api_key.is_empty() {
-                req = req.header("x-api-key", &self.config.api_key);
-                req = req.header("anthropic-version", "2023-06-01");
-            }
-
-            let resp = req.send().await?;
-            if !resp.status().is_success() {
-                let err_text = resp.text().await?;
-                return Err(anyhow!("GLM Z.AI Anthropic API error: {}", err_text));
-            }
-
-            let json_resp: serde_json::Value = resp.json().await?;
-            let content = json_resp["content"][0]["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
-            Ok(content)
-        } else {
-            let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
-            let body = json!({
-                "model": self.config.model,
-                "messages": [
-                    { "role": "system", "content": system_prompt },
-                    { "role": "user", "content": user_prompt }
-                ],
-                "max_tokens": self.config.max_tokens
-            });
-
-            let mut req = self.client.post(&url).json(&body);
-            if !self.config.api_key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", self.config.api_key));
-            }
-
-            let resp = req.send().await?;
-            if !resp.status().is_success() {
-                let err_text = resp.text().await?;
-                return Err(anyhow!("GLM Z.AI OpenAI API error: {}", err_text));
-            }
-
-            let json_resp: serde_json::Value = resp.json().await?;
-            let content = json_resp["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
-            Ok(content)
-        }
+    async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+        self.inner.chat(req).await
     }
 
-    async fn stream_completion(
+    async fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        token_tx: UnboundedSender<String>,
+    ) -> Result<ChatResponse> {
+        self.inner.chat_stream(req, token_tx).await
+    }
+
+    async fn chat_simple(
         &self,
         system_prompt: &str,
         user_prompt: &str,
-        token_tx: UnboundedSender<String>,
-    ) -> Result<String> {
-        let full_text = self.completion(system_prompt, user_prompt).await.unwrap_or_default();
-        for chunk in full_text.split_whitespace() {
-            let _ = token_tx.send(format!("{} ", chunk));
-            tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
-        }
-        Ok(full_text)
+        token_tx: Option<UnboundedSender<String>>,
+    ) -> Result<ChatResponse> {
+        self.inner.chat_simple(system_prompt, user_prompt, token_tx).await
     }
 }

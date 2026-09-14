@@ -1,1068 +1,492 @@
+//! husk TUI — opencode-style three-zone layout.
+//!
+//! ┌ top bar: mode · session · model · worker · token stats ┐
+//! │ conversation scrollback                                │
+//! └ input box (modal Normal/Insert, readline shortcuts)    ┘
+//!
+//! Leader key Ctrl+X: n new session · t theme · q quit. Tab toggles the
+//! local MiniCPM worker for subsequent turns. Slash commands: /new
+//! /sessions /stats /model <id> /quit. Prefixes: @file and !cmd route raw
+//! material through the worker fold instead of the supervisor window.
+
+pub mod input;
+pub mod theme;
+
+use std::io::{self, Stdout};
+use std::sync::Arc;
+
 use anyhow::Result;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
-    Terminal,
-};
-use std::env;
-use std::io;
-use std::time::Instant;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Terminal;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::agents::{AgentOrchestrator, ExecutionEvent};
-use crate::config::{Config, CustomProvider, ProviderPreset};
-use crate::graph::codebase::CodebaseGraph;
-use crate::graph::execution::ExecutionGraph;
-use crate::providers::create_provider;
+use crate::agents::prefix;
+use crate::agents::session::SupervisorWorkerSession;
+use crate::config::Config;
+use crate::db::Database;
+use crate::local;
+use crate::tokenutil::TokenLedger;
 
-#[derive(Clone, Debug)]
-pub struct ChatMessage {
-    pub is_user: bool,
-    pub content: String,
-    pub thought: Option<String>,
-    pub code_snippet: Option<(String, String)>, // (filename, code)
-    pub duration_secs: f64,
+use input::{InputState, Mode};
+use theme::Theme;
+
+const MAX_SCROLLBACK: usize = 500;
+
+#[derive(Debug)]
+pub enum TuiEvent {
+    Delta(String),
+    Status(String),
+    Done { worker_used: bool, escalated: bool, ledger: TokenLedger },
+    Failed(String),
+}
+
+struct App {
+    db: Arc<Database>,
+    session: Arc<tokio::sync::Mutex<SupervisorWorkerSession>>,
+    session_id: String,
+    session_title: String,
+    config: Config,
+    theme: Theme,
+    input: InputState,
+    scrollback: Vec<(Span<'static>, String)>,
+    scroll: usize,
+    busy: bool,
+    streaming: bool,
+    worker_on: bool,
+    ledger: TokenLedger,
+    pending_leader: bool,
+    last_ctrl_c: Option<std::time::Instant>,
+    model_field: String,
+}
+
+impl App {
+    fn push(&mut self, kind: Span<'static>, text: String) {
+        self.scrollback.push((kind, text));
+        if self.scrollback.len() > MAX_SCROLLBACK {
+            self.scrollback.remove(0);
+        }
+        self.scroll = 0; // stick to bottom on new content
+    }
+
+    fn role_span(&self, label: &'static str, color_key: &'static str) -> Span<'static> {
+        Span::styled(label.to_string(), Style::default().fg(self.theme.color(color_key)))
+    }
+
+    fn sys_span(&self) -> Span<'static> {
+        self.role_span("sys", "dim")
+    }
+
+    fn assistant_span(&self) -> Span<'static> {
+        self.role_span("husk", "accent")
+    }
+
+    fn new_session(&mut self) {
+        if let Ok(s) = self.db.create_session("husk", &self.config.model, None) {
+            self.session_title = s.title.clone();
+            self.session_id = s.id.clone();
+            self.push(self.sys_span(), format!("new session {}", s.id));
+        }
+    }
 }
 
 pub fn run_tui() -> Result<()> {
-    enable_raw_mode()?;
+    let config = Config::load()?;
+    let db = Arc::new(Database::open(&Config::db_path())?);
+    let session_rec = db.create_session("husk", &config.model, None)?;
+
+    let worker = local::create_local_engine(&config.local);
+    let worker_on = worker.is_some();
+    let provider = crate::providers::create_provider(&config)?;
+    let session = Arc::new(tokio::sync::Mutex::new(
+        SupervisorWorkerSession::new(provider, worker, db.clone())
+            .with_supervisor_model(config.model.clone()),
+    ));
+
+    let mut app = App {
+        db,
+        session,
+        session_id: session_rec.id,
+        session_title: session_rec.title,
+        model_field: config.model.clone(),
+        config,
+        theme: Theme::default_theme(),
+        input: InputState::default(),
+        scrollback: Vec::new(),
+        scroll: 0,
+        busy: false,
+        streaming: false,
+        worker_on,
+        ledger: TokenLedger::default(),
+        pending_leader: false,
+        last_ctrl_c: None,
+    };
+    app.push(app.sys_span(), "welcome to husk — Ctrl+X q quit · i/a edit · Esc scroll · @file !cmd".into());
+
+    let terminal = setup_terminal()?;
+    let result = event_loop(terminal, &mut app);
+    restore_terminal()?;
+    result
+}
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut config = Config::load().unwrap_or_default();
-    let mut prompt_input = String::new();
-    let mut prompt_history: Vec<String> = Vec::new();
-    let mut history_index: Option<usize> = None;
-
-    let mut messages: Vec<ChatMessage> = Vec::new();
-    let mut node_statuses: Vec<String> = vec![
-        "🧠 Orchestrator: [IDLE]".to_string(),
-        "🔨 Dev Agent: [IDLE]".to_string(),
-        "🧪 Validation QA: [IDLE]".to_string(),
-    ];
-    let mut is_running = false;
-    let mut rx_channel: Option<UnboundedReceiver<ExecutionEvent>> = None;
-    let mut scroll_offset: usize = 0;
-    let mut total_tokens_used: usize = 7563;
-    let mut active_mode = "Build".to_string();
-
-    // Modal Dialog States
-    let mut show_help_overlay = false;
-    let mut show_model_picker = false;
-    let mut show_mcp_modal = false;
-    let mut show_mode_picker = false;
-    let mut show_custom_provider_modal = false;
-
-    let mut mcp_name_input = String::new();
-    let mut mcp_cmd_input = String::new();
-    let mut mcp_form_focus = 0;
-
-    // Custom Provider Form Fields
-    let mut custom_name_input = String::new();
-    let mut custom_url_input = String::new();
-    let mut custom_model_input = String::new();
-    let mut custom_key_input = String::new();
-    let mut custom_form_focus = 0;
-
-    let presets = vec![
-        ("zai-openai", ProviderPreset::ZaiOpenAi, "GLM-5.2 Z.AI Coding Plan"),
-        ("minimax-openai", ProviderPreset::MiniMaxOpenAi, "MiniMax-M3 OpenAI"),
-        ("zai-anthropic", ProviderPreset::ZaiAnthropic, "GLM-4 Z.AI Anthropic"),
-        ("minimax-anthropic", ProviderPreset::MiniMaxAnthropic, "MiniMax-M3 Anthropic"),
-        ("openai", ProviderPreset::OpenAi, "GPT-4o OpenAI Chat"),
-        ("anthropic", ProviderPreset::Anthropic, "Claude 3.5 Sonnet Anthropic"),
-    ];
-    let mut selected_preset_idx = 0;
-
-    let modes = vec!["Build", "Plan"];
-    let mut selected_mode_idx = 0;
-
-    let slash_commands_list = vec![
-        ("/model", "Open interactive AI Model & Provider picker (GLM-5.2, MiniMax-M3)"),
-        ("/connect", "Connect & configure MCP (Model Context Protocol) server"),
-        ("/mcp", "Manage MCP server connections"),
-        ("/mode", "Switch agent mode (Build, Plan)"),
-        ("/reload", "Refresh and clear screen layout buffer"),
-        ("/context", "View active indexed files & token window stats"),
-        ("/diff", "Display git diff of workspace changes"),
-        ("/undo", "Revert last AI file modification"),
-        ("/clear", "Clear conversation history & return to home banner"),
-        ("/compact", "Compact conversation history tokens"),
-        ("/cost", "Display token usage and cost metrics"),
-        ("/help", "Show interactive slash command documentation"),
-        ("/quit", "Exit Husk-CLI application"),
-    ];
-
-    let cwd = env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "/run/media/ivan/Data/projects/husk-cli".to_string());
-
-    let mut current_thinking: Option<String> = None;
-    let mut current_code_snippet: Option<(String, String)> = None;
-    let mut start_time = Instant::now();
-
-    loop {
-        // Update live duration timer during active execution
-        if is_running {
-            let elapsed = start_time.elapsed().as_secs_f64();
-            if let Some(last_msg) = messages.last_mut() {
-                if !last_msg.is_user {
-                    last_msg.duration_secs = elapsed;
-                }
-            }
-        }
-
-        // Drain events from MPSC channel
-        if let Some(ref mut rx) = rx_channel {
-            while let Ok(evt) = rx.try_recv() {
-                match evt {
-                    ExecutionEvent::TokenStream(chunk) => {
-                        let token_count = chunk.split_whitespace().count().max(1);
-                        total_tokens_used += token_count;
-                        if let Some(last_msg) = messages.last_mut() {
-                            if !last_msg.is_user {
-                                last_msg.content.push_str(&chunk);
-                            }
-                        }
-                    }
-                    ExecutionEvent::Log(text) => {
-                        if text.contains("<!DOCTYPE html>") || text.contains("fn main()") || text.contains("code") {
-                            current_code_snippet = Some(("hello.html".to_string(), text.clone()));
-                        }
-                    }
-                    ExecutionEvent::NodeStatusChanged { node_idx, status } => {
-                        if node_idx < node_statuses.len() {
-                            let role_icon = match node_idx {
-                                0 => "🧠 Orchestrator",
-                                1 => "🔨 Dev Agent",
-                                2 => "🧪 Validation QA",
-                                _ => "Agent Node",
-                            };
-                            node_statuses[node_idx] = format!("{}: [{}]", role_icon, status);
-                        }
-                    }
-                    ExecutionEvent::OrchestratorThought(thought) => {
-                        current_thinking = Some(format!("Thought: 9ms\n{}", thought.trim()));
-                    }
-                    ExecutionEvent::DevAgentThought(thought) => {
-                        if thought.contains("<html") || thought.contains("<!DOCTYPE") {
-                            let code_lines = thought
-                                .lines()
-                                .take(11)
-                                .enumerate()
-                                .map(|(idx, line)| format!("{:2} {}", idx + 1, line))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            current_code_snippet = Some(("hello.html".to_string(), code_lines));
-                        }
-                    }
-                    ExecutionEvent::ValidationThought(thought) => {
-                        current_thinking = Some(thought);
-                    }
-                    ExecutionEvent::Finished { success } => {
-                        is_running = false;
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        if let Some(last_msg) = messages.last_mut() {
-                            if !last_msg.is_user {
-                                last_msg.duration_secs = elapsed;
-                                if last_msg.content.is_empty() {
-                                    last_msg.content = if success {
-                                        "Created hello.html with a \"Hello World\" page.".to_string()
-                                    } else {
-                                        "Execution finished with validation errors.".to_string()
-                                    };
-                                }
-                                if last_msg.thought.is_none() {
-                                    last_msg.thought = current_thinking.take();
-                                }
-                                if last_msg.code_snippet.is_none() {
-                                    last_msg.code_snippet = current_code_snippet.take();
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        terminal.draw(|f| {
-            let area = f.area();
-
-            // Main Split: Content (Top) & Footer (Bottom)
-            let main_layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(0),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-
-            let content_area = main_layout[0];
-
-            if messages.is_empty() && !is_running {
-                // --- OPENCODE-STYLE IDLE / HOME SCREEN ---
-                let banner_text =
-                    "██╗  ██╗██╗   ██╗███████╗██╗  ██╗     ██████╗██╗     ██╗\n\
-                     ██║  ██║██║   ██║██╔════╝██║ ██╔╝    ██╔════╝██║     ██║\n\
-                     ███████║██║   ██║███████╗█████═╝     ██║     ██║     ██║\n\
-                     ██╔══██║██║   ██║╚════██║██╔═██╗     ██║     ██║     ██║\n\
-                     ██║  ██║╚██████╔╝███████║██║  ██╗    ╚██████╗███████╗██║\n\
-                     ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝     ╚═════╝╚══════╝╚═╝";
-
-                let center_layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(25),
-                        Constraint::Length(7),
-                        Constraint::Length(2),
-                        Constraint::Length(5),
-                        Constraint::Length(2),
-                        Constraint::Min(0),
-                    ])
-                    .split(content_area);
-
-                // 1. Centered HUSK CLI ASCII Banner
-                let banner_p = Paragraph::new(banner_text)
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
-                f.render_widget(banner_p, center_layout[1]);
-
-                // 2. Centered OpenCode-Style Floating Prompt Input Card
-                let card_area = centered_rect(65, 5, center_layout[3]);
-                f.render_widget(Clear, card_area);
-
-                let (_preset_name, _, preset_desc) = presets[selected_preset_idx];
-                let model_tag = format!("{} · {} {} · max", active_mode, config.model, preset_desc);
-
-                let prompt_p = Paragraph::new(if prompt_input.is_empty() {
-                    format!(" Ask anything... \"Fix broken tests\"\n\n  {}", model_tag)
-                } else {
-                    format!(" {}\n\n  {}", prompt_input, model_tag)
-                })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Rgb(60, 60, 65)))
-                        .style(Style::default().bg(Color::Rgb(20, 20, 25))),
-                )
-                .wrap(Wrap { trim: false });
-                f.render_widget(prompt_p, card_area);
-
-                // 3. Shortcuts Legend
-                let legend_p = Paragraph::new("tab switch preset    /model change model    /connect mcp    /help help    q quit")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
-                f.render_widget(legend_p, center_layout[4]);
-            } else {
-                // --- OPENCODE 1:1 CHAT VIEW WITH RICH RIGHT SIDEBAR ---
-                let chat_split = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(74), // Left Chat View
-                        Constraint::Percentage(26), // Right Sidebar
-                    ])
-                    .split(content_area);
-
-                let left_chat_area = chat_split[0];
-                let right_sidebar_area = chat_split[1];
-
-                // Left Split: Message Scroll Feed & Bottom Input Box
-                let left_layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(0),
-                        Constraint::Length(5),
-                    ])
-                    .split(left_chat_area);
-
-                // Render Chat Messages cleanly with Ratatui Spans
-                let mut formatted_chat: Vec<Line> = Vec::new();
-
-                for msg in messages.iter().skip(scroll_offset) {
-                    if msg.is_user {
-                        formatted_chat.push(Line::from(vec![
-                            Span::styled(format!("  {}  ", msg.content), Style::default().bg(Color::Rgb(30, 30, 35)).fg(Color::White)),
-                        ]));
-                    } else {
-                        if let Some(ref thought) = msg.thought {
-                            formatted_chat.push(Line::from(vec![
-                                Span::styled(format!("+ {}", thought.lines().next().unwrap_or("Thought: 9ms")), Style::default().fg(Color::Yellow)),
-                            ]));
-                        }
-
-                        if let Some((ref filename, ref code)) = msg.code_snippet {
-                            formatted_chat.push(Line::from(vec![
-                                Span::styled(format!("# Wrote {}", filename), Style::default().fg(Color::Rgb(160, 160, 160))),
-                            ]));
-                            for code_line in code.lines() {
-                                formatted_chat.push(Line::from(vec![
-                                    Span::styled(code_line, Style::default().bg(Color::Rgb(25, 25, 30)).fg(Color::Gray)),
-                                ]));
-                            }
-                        }
-
-                        formatted_chat.push(Line::from(Span::raw(msg.content.clone())));
-                        formatted_chat.push(Line::from(vec![
-                            Span::styled(format!("■ {} · {} · {:.1}s", active_mode, config.model, msg.duration_secs), Style::default().fg(Color::Cyan)),
-                        ]));
-                    }
-                    formatted_chat.push(Line::from(""));
-                }
-
-                let chat_p = Paragraph::new(formatted_chat)
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(Color::White));
-                f.render_widget(chat_p, left_layout[0]);
-
-                // Bottom Floating Input Box inside Chat
-                let (_preset_name, _, preset_desc) = presets[selected_preset_idx];
-                let model_tag = format!("{} · {} {} · max", active_mode, config.model, preset_desc);
-
-                let input_p = Paragraph::new(if prompt_input.is_empty() {
-                    format!(" \n\n  {}", model_tag)
-                } else {
-                    format!(" {}\n\n  {}", prompt_input, model_tag)
-                })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Rgb(60, 60, 65)))
-                        .style(Style::default().bg(Color::Rgb(20, 20, 25))),
-                )
-                .wrap(Wrap { trim: false });
-                f.render_widget(input_p, left_layout[1]);
-
-                // --- RICH RIGHT SIDEBAR PANEL ---
-                let sidebar_layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3), // Session Title & Mode
-                        Constraint::Length(6), // Token Gauge & Cost Widget
-                        Constraint::Length(6), // Active Context Files
-                        Constraint::Length(4), // MCP Servers Status
-                        Constraint::Length(3), // LSP Status
-                        Constraint::Min(0),
-                        Constraint::Length(2), // Bottom Right Path Info
-                    ])
-                    .split(right_sidebar_area);
-
-                // 1. Session Title Header & Active Mode
-                let session_title = format!("Greeting\nMode: {} ({})", active_mode, config.model);
-                let title_p = Paragraph::new(session_title)
-                    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-                f.render_widget(title_p, sidebar_layout[0]);
-
-                // 2. Token Gauge & Cost Block
-                let context_percent = ((total_tokens_used as f64 / 128000.0) * 100.0) as usize;
-                let gauge_ratio = (total_tokens_used as f64 / 128000.0).min(1.0);
-                
-                let token_gauge = Gauge::default()
-                    .block(Block::default().title(format!(" Context ({}%) ", context_percent)).style(Style::default().fg(Color::DarkGray)))
-                    .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 35)))
-                    .ratio(gauge_ratio)
-                    .label(format!("{} / 128K", format_tokens(total_tokens_used)));
-                f.render_widget(token_gauge, sidebar_layout[1]);
-
-                // 3. Active Context Files List
-                let context_files = vec![
-                    "📄 src/main.rs",
-                    "📄 src/tui/mod.rs",
-                    "📄 src/config.rs",
-                    "📄 spec.md",
-                ];
-                let context_items: Vec<ListItem> = context_files
-                    .iter()
-                    .map(|f| ListItem::new(*f).style(Style::default().fg(Color::Gray)))
-                    .collect();
-                let context_list = List::new(context_items)
-                    .block(Block::default().borders(Borders::ALL).title(" Context Files (24 AST) ").border_style(Style::default().fg(Color::DarkGray)));
-                f.render_widget(context_list, sidebar_layout[2]);
-
-                // 4. MCP Servers Connection Status Widget
-                let mcp_status_text = "🟢 filesystem-server [active]\n🟢 git-mcp [active]";
-                let mcp_p = Paragraph::new(mcp_status_text)
-                    .style(Style::default().fg(Color::Green))
-                    .block(Block::default().borders(Borders::ALL).title(" MCP Servers ").border_style(Style::default().fg(Color::DarkGray)));
-                f.render_widget(mcp_p, sidebar_layout[3]);
-
-                // 5. LSP Status Block
-                let lsp_p = Paragraph::new("LSP: rust-analyzer active")
-                    .style(Style::default().fg(Color::DarkGray));
-                f.render_widget(lsp_p, sidebar_layout[4]);
-
-                // 6. Sidebar Footer
-                let sidebar_footer = Paragraph::new(format!("{}\n🟢 Husk-CLI 0.1.0", cwd))
-                    .style(Style::default().fg(Color::DarkGray));
-                f.render_widget(sidebar_footer, sidebar_layout[6]);
-            }
-
-            // --- FLOATING SLASH COMMAND AUTOCOMPLETE OVERLAY ---
-            if prompt_input.starts_with('/') && !show_model_picker && !show_mcp_modal && !show_mode_picker && !show_custom_provider_modal {
-                let matching_cmds: Vec<ListItem> = slash_commands_list
-                    .iter()
-                    .filter(|(cmd, _)| cmd.starts_with(prompt_input.trim()))
-                    .map(|(cmd, desc)| {
-                        ListItem::new(format!(" {:12} - {}", cmd, desc))
-                            .style(Style::default().fg(Color::Cyan))
-                    })
-                    .collect();
-
-                if !matching_cmds.is_empty() {
-                    let popup_area = centered_rect(65, (matching_cmds.len() as u16 + 2).min(8), content_area);
-                    f.render_widget(Clear, popup_area);
-
-                    let list_widget = List::new(matching_cmds)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(" Slash Commands (Press Tab/Enter to Select) ")
-                                .border_style(Style::default().fg(Color::Cyan))
-                                .style(Style::default().bg(Color::Rgb(15, 15, 20))),
-                        );
-                    f.render_widget(list_widget, popup_area);
-                }
-            }
-
-            // Bottom Footer Bar
-            let footer_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(70),
-                    Constraint::Percentage(30),
-                ])
-                .split(main_layout[1]);
-
-            let cwd_p = Paragraph::new(cwd.clone())
-                .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(cwd_p, footer_layout[0]);
-
-            let right_status = format!("{:.1}K ({}%)   ctrl+p commands", total_tokens_used as f64 / 1000.0, (total_tokens_used as f64 / 128000.0 * 100.0) as usize);
-            let right_p = Paragraph::new(right_status)
-                .alignment(Alignment::Right)
-                .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(right_p, footer_layout[1]);
-
-            // --- INTERACTIVE MODAL DIALOGS ---
-
-            // 1. Interactive Model Picker Dialog (`/model`)
-            if show_model_picker {
-                let modal_area = centered_rect(75, 11, area);
-                f.render_widget(Clear, modal_area);
-
-                let mut preset_items: Vec<ListItem> = presets
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, (name, _, desc))| {
-                        let prefix = if idx == selected_preset_idx { " ▶ " } else { "   " };
-                        let content = format!("{}{}: {}", prefix, name, desc);
-                        let style = if idx == selected_preset_idx {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
-                        ListItem::new(content).style(style)
-                    })
-                    .collect();
-
-                let custom_opt_prefix = if selected_preset_idx == presets.len() { " ▶ " } else { "   " };
-                preset_items.push(
-                    ListItem::new(format!("{}[ + Add Custom Model / Provider JSON ]", custom_opt_prefix)).style(
-                        if selected_preset_idx == presets.len() {
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        },
-                    ),
-                );
-
-                let model_list = List::new(preset_items)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Select AI Model & Provider (Up/Down Arrow & Enter) ")
-                            .border_style(Style::default().fg(Color::Yellow))
-                            .style(Style::default().bg(Color::Rgb(15, 15, 20))),
-                    );
-                f.render_widget(model_list, modal_area);
-            }
-
-            // 2. Interactive Custom Model / Provider Form Modal
-            if show_custom_provider_modal {
-                let modal_area = centered_rect(75, 10, area);
-                f.render_widget(Clear, modal_area);
-
-                let form_text = format!(
-                    " 1. Provider Name : {}\n\
-                     2. Base URL      : {}\n\
-                     3. Model ID      : {}\n\
-                     4. API Key       : {}\n\n\
-                     [ Press Tab to switch fields, Enter to Save to .husk/providers.json, Esc to Cancel ]",
-                    if custom_name_input.is_empty() { "<e.g. DeepSeek Local>" } else { &custom_name_input },
-                    if custom_url_input.is_empty() { "<e.g. https://api.deepseek.com/v1>" } else { &custom_url_input },
-                    if custom_model_input.is_empty() { "<e.g. deepseek-coder>" } else { &custom_model_input },
-                    if custom_key_input.is_empty() { "<e.g. sk-key>" } else { &custom_key_input }
-                );
-
-                let custom_p = Paragraph::new(form_text)
-                    .style(Style::default().fg(Color::Cyan).bg(Color::Rgb(15, 15, 20)))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Add Custom Model & Provider (.husk/providers.json) ")
-                            .border_style(Style::default().fg(Color::Cyan)),
-                    );
-                f.render_widget(custom_p, modal_area);
-            }
-
-            // 3. Interactive MCP Connection Dialog (`/connect` / `/mcp`)
-            if show_mcp_modal {
-                let modal_area = centered_rect(70, 8, area);
-                f.render_widget(Clear, modal_area);
-
-                let form_text = format!(
-                    " 1. MCP Server Name: {}\n\n 2. Execution Command / Transport: {}\n\n [ Press Tab to switch fields, Enter to Save & Connect, Esc to Cancel ]",
-                    if mcp_name_input.is_empty() { "<e.g. filesystem-server>" } else { &mcp_name_input },
-                    if mcp_cmd_input.is_empty() { "<e.g. npx -y @modelcontextprotocol/server-filesystem .>" } else { &mcp_cmd_input }
-                );
-
-                let mcp_p = Paragraph::new(form_text)
-                    .style(Style::default().fg(Color::Cyan).bg(Color::Rgb(15, 15, 20)))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Connect & Register MCP Server ")
-                            .border_style(Style::default().fg(Color::Cyan)),
-                    );
-                f.render_widget(mcp_p, modal_area);
-            }
-
-            // 4. Interactive Mode Picker Dialog (`/mode`)
-            if show_mode_picker {
-                let modal_area = centered_rect(50, 6, area);
-                f.render_widget(Clear, modal_area);
-
-                let mode_items: Vec<ListItem> = modes
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, m)| {
-                        let prefix = if idx == selected_mode_idx { " ▶ " } else { "   " };
-                        let style = if idx == selected_mode_idx {
-                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
-                        ListItem::new(format!("{}{}", prefix, m)).style(style)
-                    })
-                    .collect();
-
-                let mode_list = List::new(mode_items)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Select Agent Mode (Up/Down & Enter) ")
-                            .border_style(Style::default().fg(Color::Green))
-                            .style(Style::default().bg(Color::Rgb(15, 15, 20))),
-                    );
-                f.render_widget(mode_list, modal_area);
-            }
-
-            // 5. Help Menu Overlay
-            if show_help_overlay {
-                let help_area = centered_rect(70, 16, area);
-                f.render_widget(Clear, help_area);
-
-                let help_text =
-                    "┌───────────────────── HUSK-CLI SLASH COMMANDS & SHORTCUTS ─────────────────────┐\n\
-                     │  /model         : Select AI Model (GLM-5.2, MiniMax-M3, Custom Provider)    │\n\
-                     │  /connect /mcp  : Connect & configure MCP server dialog                      │\n\
-                     │  /mode          : Switch Agent Mode (Build, Plan) dialog                    │\n\
-                     │  /reload        : Refresh and clear screen layout buffer                     │\n\
-                     │  /clear         : Clear session history & return to main banner              │\n\
-                     │  /context       : View active indexed files & token context window           │\n\
-                     │  /diff          : Display git diff of current workspace changes              │\n\
-                     │  /undo          : Revert last AI file modification                           │\n\
-                     │  /compact       : Compact conversation history tokens                        │\n\
-                     │  /cost /tokens  : Display token usage and cost metrics                       │\n\
-                     │  /quit, /exit   : Exit Husk-CLI TUI                                          │\n\
-                     ├──────────────────────────────────────────────────────────────────────────────┤\n\
-                     │  Shortcuts: Ctrl+C (Abort) | Ctrl+R (Reload Screen) | Ctrl+L (Clear Screen)  │\n\
-                     │            Ctrl+U (Clear Line) | Ctrl+W (Delete Word) | Up/Down (History)   │\n\
-                     └──────────────────────────────────────────────────────────────────────────────┘";
-
-                let help_p = Paragraph::new(help_text)
-                    .style(Style::default().fg(Color::Cyan).bg(Color::Rgb(15, 15, 20)))
-                    .block(Block::default().borders(Borders::ALL).title(" Help Menu (Press Esc to Close) "));
-                f.render_widget(help_p, help_area);
-            }
-        })?;
-
-        if event::poll(std::time::Duration::from_millis(50))? {
-            match event::read()? {
-                // Window Resize Event -> Force Clear Terminal Screen
-                Event::Resize(_, _) => {
-                    terminal.clear()?;
-                }
-
-                Event::Mouse(mouse_evt) => match mouse_evt.kind {
-                    MouseEventKind::ScrollUp => {
-                        if scroll_offset > 0 {
-                            scroll_offset -= 1;
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if scroll_offset < messages.len() {
-                            scroll_offset += 1;
-                        }
-                    }
-                    _ => {}
-                },
-
-                Event::Key(key) => {
-                    // Global Shortcuts: Ctrl+C, Ctrl+R, Ctrl+L, Ctrl+U, Ctrl+W
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        match key.code {
-                            KeyCode::Char('c') => {
-                                is_running = false;
-                                prompt_input.clear();
-                                show_model_picker = false;
-                                show_mcp_modal = false;
-                                show_mode_picker = false;
-                                show_custom_provider_modal = false;
-                                show_help_overlay = false;
-                            }
-                            KeyCode::Char('r') => {
-                                terminal.clear()?;
-                            }
-                            KeyCode::Char('l') => {
-                                messages.clear();
-                                terminal.clear()?;
-                            }
-                            KeyCode::Char('u') => {
-                                prompt_input.clear();
-                            }
-                            KeyCode::Char('w') => {
-                                let mut words: Vec<&str> = prompt_input.split_whitespace().collect();
-                                words.pop();
-                                prompt_input = words.join(" ");
-                                if !prompt_input.is_empty() {
-                                    prompt_input.push(' ');
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // Handle Interactive Model Picker Dialog Input
-                    if show_model_picker {
-                        match key.code {
-                            KeyCode::Esc => show_model_picker = false,
-                            KeyCode::Up => {
-                                if selected_preset_idx > 0 {
-                                    selected_preset_idx -= 1;
-                                }
-                            }
-                            KeyCode::Down => {
-                                if selected_preset_idx < presets.len() {
-                                    selected_preset_idx += 1;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                show_model_picker = false;
-                                if selected_preset_idx == presets.len() {
-                                    show_custom_provider_modal = true;
-                                } else {
-                                    let (name, ref preset, _desc) = presets[selected_preset_idx];
-                                    config.apply_preset(preset.clone());
-                                    let _ = config.save();
-                                    messages.push(ChatMessage {
-                                        is_user: false,
-                                        content: format!("✔ Switched Model & Provider to '{}' ({})", config.model, name),
-                                        thought: None,
-                                        code_snippet: None,
-                                        duration_secs: 0.1,
-                                    });
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // Handle Custom Provider Dialog Input
-                    if show_custom_provider_modal {
-                        match key.code {
-                            KeyCode::Esc => show_custom_provider_modal = false,
-                            KeyCode::Tab => custom_form_focus = (custom_form_focus + 1) % 4,
-                            KeyCode::Char(c) => match custom_form_focus {
-                                0 => custom_name_input.push(c),
-                                1 => custom_url_input.push(c),
-                                2 => custom_model_input.push(c),
-                                3 => custom_key_input.push(c),
-                                _ => {}
-                            },
-                            KeyCode::Backspace => match custom_form_focus {
-                                0 => { custom_name_input.pop(); }
-                                1 => { custom_url_input.pop(); }
-                                2 => { custom_model_input.pop(); }
-                                3 => { custom_key_input.pop(); }
-                                _ => {}
-                            },
-                            KeyCode::Enter => {
-                                if !custom_name_input.is_empty() && !custom_url_input.is_empty() && !custom_model_input.is_empty() {
-                                    show_custom_provider_modal = false;
-                                    let custom_prov = CustomProvider {
-                                        name: custom_name_input.clone(),
-                                        base_url: custom_url_input.clone(),
-                                        model: custom_model_input.clone(),
-                                        api_key: custom_key_input.clone(),
-                                    };
-                                    config.provider = ProviderPreset::Custom;
-                                    config.base_url = custom_prov.base_url.clone();
-                                    config.model = custom_prov.model.clone();
-                                    config.api_key = custom_prov.api_key.clone();
-                                    let _ = config.save();
-                                    let _ = Config::save_custom_provider(custom_prov.clone());
-
-                                    messages.push(ChatMessage {
-                                        is_user: false,
-                                        content: format!("✔ Saved & Switched Custom Provider '{}' (Model: {}) to .husk/providers.json", custom_prov.name, custom_prov.model),
-                                        thought: None,
-                                        code_snippet: None,
-                                        duration_secs: 0.1,
-                                    });
-
-                                    custom_name_input.clear();
-                                    custom_url_input.clear();
-                                    custom_model_input.clear();
-                                    custom_key_input.clear();
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // Handle Interactive MCP Connection Dialog Input
-                    if show_mcp_modal {
-                        match key.code {
-                            KeyCode::Esc => show_mcp_modal = false,
-                            KeyCode::Tab => mcp_form_focus = (mcp_form_focus + 1) % 2,
-                            KeyCode::Char(c) => {
-                                if mcp_form_focus == 0 {
-                                    mcp_name_input.push(c);
-                                } else {
-                                    mcp_cmd_input.push(c);
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                if mcp_form_focus == 0 {
-                                    mcp_name_input.pop();
-                                } else {
-                                    mcp_cmd_input.pop();
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if !mcp_name_input.is_empty() && !mcp_cmd_input.is_empty() {
-                                    show_mcp_modal = false;
-                                    let server_name = mcp_name_input.clone();
-                                    let server_cmd = mcp_cmd_input.clone();
-                                    mcp_name_input.clear();
-                                    mcp_cmd_input.clear();
-
-                                    messages.push(ChatMessage {
-                                        is_user: false,
-                                        content: format!("✔ Connected MCP Server '{}' with command '{}'", server_name, server_cmd),
-                                        thought: None,
-                                        code_snippet: None,
-                                        duration_secs: 0.1,
-                                    });
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // Handle Interactive Mode Picker Dialog Input
-                    if show_mode_picker {
-                        match key.code {
-                            KeyCode::Esc => show_mode_picker = false,
-                            KeyCode::Up => {
-                                if selected_mode_idx > 0 {
-                                    selected_mode_idx -= 1;
-                                }
-                            }
-                            KeyCode::Down => {
-                                if selected_mode_idx + 1 < modes.len() {
-                                    selected_mode_idx += 1;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                show_mode_picker = false;
-                                active_mode = modes[selected_mode_idx].to_string();
-                                messages.push(ChatMessage {
-                                    is_user: false,
-                                    content: format!("✔ Switched Agent Mode to '{}'", active_mode),
-                                    thought: None,
-                                    code_snippet: None,
-                                    duration_secs: 0.1,
-                                });
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    match key.code {
-                        KeyCode::Esc => {
-                            if show_help_overlay {
-                                show_help_overlay = false;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        KeyCode::Char('q') if prompt_input.is_empty() && !is_running => break,
-
-                        KeyCode::Tab => {
-                            if prompt_input.starts_with('/') {
-                                if let Some((cmd, _)) = slash_commands_list.iter().find(|(cmd, _)| cmd.starts_with(prompt_input.trim())) {
-                                    prompt_input = cmd.to_string();
-                                }
-                            } else {
-                                selected_preset_idx = (selected_preset_idx + 1) % presets.len();
-                                let (_name, ref preset, _desc) = presets[selected_preset_idx];
-                                config.apply_preset(preset.clone());
-                                let _ = config.save();
-                            }
-                        }
-
-                        // Up/Down Arrow Navigation
-                        KeyCode::Up => {
-                            if !prompt_history.is_empty() {
-                                let next_idx = match history_index {
-                                    Some(idx) if idx > 0 => idx - 1,
-                                    _ => prompt_history.len() - 1,
-                                };
-                                history_index = Some(next_idx);
-                                prompt_input = prompt_history[next_idx].clone();
-                            }
-                        }
-                        KeyCode::Down => {
-                            if let Some(idx) = history_index {
-                                if idx + 1 < prompt_history.len() {
-                                    history_index = Some(idx + 1);
-                                    prompt_input = prompt_history[idx + 1].clone();
-                                } else {
-                                    history_index = None;
-                                    prompt_input.clear();
-                                }
-                            }
-                        }
-
-                        KeyCode::Char(c) if !is_running => {
-                            prompt_input.push(c);
-                        }
-                        KeyCode::Backspace if !is_running => {
-                            prompt_input.pop();
-                        }
-
-                        KeyCode::Enter if !is_running && !prompt_input.is_empty() => {
-                            let input = prompt_input.trim().to_string();
-                            prompt_input.clear();
-                            prompt_history.push(input.clone());
-                            history_index = None;
-
-                            // Handle Slash Commands
-                            if input.starts_with('/') {
-                                match parse_slash_command(&input) {
-                                    SlashCommand::ModelPicker => show_model_picker = true,
-                                    SlashCommand::McpConnect => show_mcp_modal = true,
-                                    SlashCommand::ModePicker => show_mode_picker = true,
-                                    SlashCommand::Reload => {
-                                        terminal.clear()?;
-                                    }
-                                    SlashCommand::Help => show_help_overlay = true,
-                                    SlashCommand::Clear => {
-                                        messages.clear();
-                                        terminal.clear()?;
-                                    }
-                                    SlashCommand::Context => {
-                                        let graph_file = Config::husk_dir().join("graph.json");
-                                        let file_count = if graph_file.exists() {
-                                            CodebaseGraph::load_from_file(&graph_file)
-                                                .map(|g| g.export_data().nodes.len())
-                                                .unwrap_or(0)
-                                        } else {
-                                            0
-                                        };
-                                        messages.push(ChatMessage {
-                                            is_user: false,
-                                            content: format!("📊 Active Context: {} files indexed, {} tokens used.", file_count, total_tokens_used),
-                                            thought: None,
-                                            code_snippet: None,
-                                            duration_secs: 0.1,
-                                        });
-                                    }
-                                    SlashCommand::Cost => {
-                                        messages.push(ChatMessage {
-                                            is_user: false,
-                                            content: format!("💰 Token Usage: {} tokens (~$0.00 spent)", total_tokens_used),
-                                            thought: None,
-                                            code_snippet: None,
-                                            duration_secs: 0.1,
-                                        });
-                                    }
-                                    SlashCommand::Quit => break,
-                                    SlashCommand::Unknown(cmd) => {
-                                        messages.push(ChatMessage {
-                                            is_user: false,
-                                            content: format!("Unknown command '{}'. Type /help for available commands.", cmd),
-                                            thought: None,
-                                            code_snippet: None,
-                                            duration_secs: 0.1,
-                                        });
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // Regular Prompt Submission
-                            let input_tokens = (input.len() / 4).max(5);
-                            total_tokens_used += input_tokens;
-
-                            messages.push(ChatMessage {
-                                is_user: true,
-                                content: input.clone(),
-                                thought: None,
-                                code_snippet: None,
-                                duration_secs: 0.0,
-                            });
-
-                            // Prepare empty AI message slot for word-by-word streaming
-                            messages.push(ChatMessage {
-                                is_user: false,
-                                content: String::new(),
-                                thought: Some("Thought: running...".to_string()),
-                                code_snippet: None,
-                                duration_secs: 0.1,
-                            });
-
-                            is_running = true;
-                            start_time = Instant::now();
-                            node_statuses = vec![
-                                "🧠 Orchestrator: [RUNNING]".to_string(),
-                                "🔨 Dev Agent: [PENDING]".to_string(),
-                                "🧪 Validation QA: [PENDING]".to_string(),
-                            ];
-
-                            let (tx, rx) = unbounded_channel();
-                            rx_channel = Some(rx);
-
-                            let cfg = config.clone();
-                            tokio::spawn(async move {
-                                if let Ok(provider_inst) = create_provider(&cfg) {
-                                    let mut orchestrator = AgentOrchestrator::new(provider_inst);
-                                    let mut exec_graph = ExecutionGraph::new_default_pipeline(&input, Vec::new(), 5);
-                                    let _ = orchestrator.execute_graph_with_sender(&mut exec_graph, Some(tx)).await;
-                                }
-                            });
-                        }
-
-                        _ => {}
-                    }
-                }
-
-                _ => {}
-            }
-        }
-    }
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    println!("Exited Husk-CLI Interface.");
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+fn restore_terminal() -> Result<()> {
+    let mut stdout = io::stdout();
+    crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen)?;
+    crossterm::terminal::disable_raw_mode()?;
     Ok(())
 }
 
-enum SlashCommand {
-    Help,
-    Clear,
-    Reload,
-    ModelPicker,
-    McpConnect,
-    ModePicker,
-    Context,
-    Cost,
-    Quit,
-    Unknown(String),
+fn event_loop(mut terminal: Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    let (event_tx, mut event_rx): (UnboundedSender<TuiEvent>, UnboundedReceiver<TuiEvent>) =
+        unbounded_channel();
+
+    loop {
+        terminal.draw(|f| draw(f, app))?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(80))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if key.kind == crossterm::event::KeyEventKind::Press {
+                    handle_key(app, key, &event_tx);
+                }
+            }
+        }
+
+        // Drain worker events.
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                TuiEvent::Delta(delta) => {
+                    if !app.streaming {
+                        app.push(app.assistant_span(), "husk: ".into());
+                        app.streaming = true;
+                    }
+                    if let Some((_, last)) = app.scrollback.last_mut() {
+                        last.push_str(&delta);
+                    }
+                }
+                TuiEvent::Status(status) => app.push(app.sys_span(), status),
+                TuiEvent::Done { worker_used, escalated, ledger } => {
+                    app.ledger = ledger;
+                    app.busy = false;
+                    app.streaming = false;
+                    app.push(
+                        app.sys_span(),
+                        format!(
+                            "─ worker:{} escalated:{} saved:{}tok cost:${:.4}",
+                            if worker_used { "on" } else { "off" },
+                            if escalated { "yes" } else { "no" },
+                            ledger.saved_tokens(),
+                            ledger.cloud_cost(&crate::agents::session::DEEPSEEK_FLASH_PRICING)
+                        ),
+                    );
+                    let _ = escalated;
+                }
+                TuiEvent::Failed(err) => {
+                    app.busy = false;
+                    app.streaming = false;
+                    app.push(
+                        Span::styled("err", Style::default().fg(app.theme.color("error"))),
+                        err,
+                    );
+                }
+            }
+        }
+    }
 }
 
-fn parse_slash_command(input: &str) -> SlashCommand {
-    let parts: Vec<&str> = input.trim().split_whitespace().collect();
-    if parts.is_empty() {
-        return SlashCommand::Unknown(input.to_string());
+fn handle_key(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    event_tx: &UnboundedSender<TuiEvent>,
+) {
+    use crossterm::event::KeyCode;
+
+    // Ctrl+C twice to quit.
+    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('c')
+    {
+        let now = std::time::Instant::now();
+        if app.last_ctrl_c.map(|t| now.duration_since(t).as_millis() < 1200).unwrap_or(false) {
+            std::process::exit(0);
+        }
+        app.last_ctrl_c = Some(now);
+        return;
     }
 
-    match parts[0] {
-        "/help" => SlashCommand::Help,
-        "/clear" => SlashCommand::Clear,
-        "/reload" => SlashCommand::Reload,
-        "/model" => SlashCommand::ModelPicker,
-        "/connect" | "/mcp" => SlashCommand::McpConnect,
-        "/mode" => SlashCommand::ModePicker,
-        "/context" => SlashCommand::Context,
-        "/cost" | "/tokens" => SlashCommand::Cost,
-        "/quit" | "/exit" => SlashCommand::Quit,
-        _ => SlashCommand::Unknown(parts[0].to_string()),
+    // Leader handling: Ctrl+X then one key.
+    if app.pending_leader {
+        app.pending_leader = false;
+        match key.code {
+            KeyCode::Char('n') => app.new_session(),
+            KeyCode::Char('t') => {
+                app.theme = app.theme.cycle();
+                app.push(app.sys_span(), format!("theme → {}", app.theme.name));
+            }
+            KeyCode::Char('q') => {
+                restore_terminal().ok();
+                std::process::exit(0);
+            }
+            other => app.push(app.sys_span(), format!("unknown leader key {other:?}")),
+        }
+        return;
+    }
+
+    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('x') => {
+                app.pending_leader = true;
+                return;
+            }
+            KeyCode::Char('a') => return app.input.home(),
+            KeyCode::Char('e') => return app.input.end(),
+            KeyCode::Char('k') => return app.input.kill_to_end(),
+            KeyCode::Char('u') => return app.input.kill_to_start(),
+            _ => {}
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.input.handle_esc();
+        }
+        KeyCode::Tab => {
+            if app.input.mode == Mode::Normal {
+                toggle_worker(app);
+            }
+        }
+        KeyCode::Enter => {
+            if app.input.mode == Mode::Insert && !app.busy {
+                let raw = app.input.submit();
+                submit(app, &raw, event_tx);
+            }
+        }
+        KeyCode::Backspace => {
+            if app.input.mode == Mode::Insert {
+                app.input.backspace();
+            }
+        }
+        KeyCode::Delete => app.input.delete(),
+        KeyCode::Left => app.input.left(),
+        KeyCode::Right => app.input.right(),
+        KeyCode::Up => app.scroll = (app.scroll + 1).min(app.scrollback.len()),
+        KeyCode::Down => app.scroll = app.scroll.saturating_sub(1),
+        KeyCode::Char(c) => {
+            if app.input.mode == Mode::Normal {
+                match c {
+                    'k' => app.scroll = (app.scroll + 1).min(app.scrollback.len()),
+                    'j' | 'G' => app.scroll = 0,
+                    _ => {
+                        app.input.handle_char(c);
+                    }
+                }
+            } else {
+                app.input.handle_char(c);
+            }
+        }
+        _ => {}
     }
 }
 
-fn format_tokens(n: usize) -> String {
-    if n >= 1000 {
-        format!("{},{:03}", n / 1000, n % 1000)
+fn toggle_worker(app: &mut App) {
+    if app.worker_on {
+        app.worker_on = false;
+        if let Ok(mut session) = app.session.try_lock() {
+            session.set_worker(None);
+        }
+        app.push(app.sys_span(), "worker → off (cloud-only)".into());
     } else {
-        n.to_string()
+        match local::create_local_engine(&app.config.local) {
+            Some(engine) => {
+                let describe = engine.describe();
+                app.worker_on = true;
+                if let Ok(mut session) = app.session.try_lock() {
+                    session.set_worker(Some(engine));
+                }
+                app.push(app.sys_span(), format!("worker → on ({describe})"));
+            }
+            None => {
+                app.worker_on = false;
+                app.push(
+                    Span::styled("warn", Style::default().fg(app.theme.color("warn"))),
+                    "local worker unavailable (needs --features local + enabled config)".into(),
+                );
+            }
+        }
     }
 }
 
-fn centered_rect(percent_x: u16, height_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length((r.height.saturating_sub(height_y)) / 2),
-            Constraint::Length(height_y),
-            Constraint::Min(0),
-        ])
-        .split(r);
+fn submit(app: &mut App, raw: &str, event_tx: &UnboundedSender<TuiEvent>) {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return;
+    }
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    // Slash commands.
+    if let Some(rest) = raw.strip_prefix('/') {
+        let mut parts = rest.split_whitespace();
+        match parts.next() {
+            Some("quit" | "q") => {
+                restore_terminal().ok();
+                std::process::exit(0);
+            }
+            Some("new") => app.new_session(),
+            Some("sessions") => {
+                if let Ok(list) = app.db.list_sessions(10) {
+                    for s in list {
+                        app.push(app.sys_span(), format!("{}  {} [{}]", s.id, s.title, s.updated_at));
+                    }
+                }
+            }
+            Some("stats") => {
+                if let Ok(l) = app.db.session_ledger(&app.session_id) {
+                    app.ledger = l;
+                    app.push(app.sys_span(), format!("saved {} tokens so far", app.ledger.saved_tokens()));
+                }
+            }
+            Some("model") => {
+                let model = parts.collect::<Vec<_>>().join(" ");
+                if !model.is_empty() {
+                    app.config.model = model.clone();
+                    if let Ok(mut s) = app.session.try_lock() {
+                        s.supervisor_model = model.clone();
+                    }
+                    app.model_field = model;
+                    let _ = app.config.save();
+                    app.push(app.sys_span(), "model updated".into());
+                }
+            }
+            other => app.push(app.sys_span(), format!("unknown command {other:?} — /new /sessions /stats /model /quit")),
+        }
+        return;
+    }
+
+    // Parse @file / !cmd prefixes.
+    let parsed = prefix::parse(raw);
+    let user_span = app.role_span("you", "ok");
+    app.push(user_span, format!("you: {}", parsed.text));
+
+    app.busy = true;
+    let session = app.session.clone();
+    let session_id = app.session_id.clone();
+    let docs = parsed.docs;
+    let text = parsed.text;
+    let tx = event_tx.clone();
+    let (delta_tx, mut delta_rx) = unbounded_channel::<String>();
+
+    // Relay provider deltas into TUI events.
+    let relay_tx = tx.clone();
+    tokio::spawn(async move {
+        while let Some(delta) = delta_rx.recv().await {
+            let _ = relay_tx.send(TuiEvent::Delta(delta));
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut session = session.lock().await;
+        match session.send_streamed(&session_id, &text, &docs, Some(delta_tx)).await {
+            Ok(outcome) => {
+                let _ = tx.send(TuiEvent::Done {
+                    worker_used: outcome.worker_used,
+                    escalated: outcome.worker_escalated,
+                    ledger: outcome.ledger,
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(TuiEvent::Failed(format!("{e:#}")));
+            }
+        }
+    });
 }
+
+fn draw(f: &mut ratatui::Frame, app: &mut App) {
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(3),
+    ])
+    .split(f.area());
+
+    // --- top bar ---
+    let saved = app.ledger.saved_tokens();
+    let top = Line::from(vec![
+        Span::styled(
+            format!(" {} ", if app.input.mode == Mode::Insert { "INSERT" } else { "NORMAL" }),
+            Style::default().fg(app.theme.color("accent")).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" session:{} ", truncate(&app.session_title, 24)),
+            Style::default().fg(app.theme.color("text")),
+        ),
+        Span::styled(
+            format!(" model:{} ", truncate(&app.model_field, 34)),
+            Style::default().fg(app.theme.color("dim")),
+        ),
+        Span::styled(
+            format!(" worker:{} ", if app.worker_on { "on" } else { "off" }),
+            Style::default().fg(app.theme.color(if app.worker_on { "ok" } else { "dim" })),
+        ),
+        Span::styled(
+            format!(" sup:{}tok saved:{saved}tok cost:${:.4} ", app.ledger.supervisor.prompt_tokens, app.ledger.cloud_cost(&crate::agents::session::DEEPSEEK_FLASH_PRICING)),
+            Style::default().fg(app.theme.color("warn")),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(top), chunks[0]);
+
+    // --- scrollback ---
+    let area_height = chunks[1].height.saturating_sub(2) as usize;
+    let total = app.scrollback.len();
+    let visible_end = total.saturating_sub(app.scroll);
+    let visible_start = visible_end.saturating_sub(area_height * 3);
+    let lines: Vec<Line> = app.scrollback[visible_start..visible_end.max(visible_start)]
+        .iter()
+        .map(|(label, text)| {
+            Line::from(vec![label.clone(), Span::styled(format!(" {text}"), Style::default().fg(app.theme.color("text")))])
+        })
+        .collect();
+    let scroll_from_end = area_height.saturating_sub(1);
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll as u16, 0))
+        .block(Block::default().borders(Borders::TOP));
+    f.render_widget(para, chunks[1]);
+    let _ = scroll_from_end;
+
+    // --- input ---
+    let mode_hint = if app.input.mode == Mode::Insert {
+        "type — Enter send · Esc scroll · Ctrl+X leader"
+    } else {
+        "normal — j/k scroll · i edit · Tab worker"
+    };
+    let prompt_label = if app.input.mode == Mode::Insert { "> " } else { ": " };
+    let input_text = Line::from(vec![
+        Span::styled(prompt_label, Style::default().fg(app.theme.color("accent")).add_modifier(Modifier::BOLD)),
+        Span::styled(app.input.text.clone(), Style::default().fg(app.theme.color("text"))),
+        Span::styled("▌", Style::default().fg(app.theme.color("accent"))),
+        Span::styled(format!("  {mode_hint}"), Style::default().fg(app.theme.color("dim"))),
+    ]);
+    f.render_widget(
+        Paragraph::new(input_text).block(Block::default().borders(Borders::TOP)),
+        chunks[2],
+    );
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else {
+        &s[..max.saturating_sub(1)]
+    }
+}
+
+// Keep the compiler happy: the event loop is sync but awaits briefly via the
+// runtime handle owned by main.
+async fn _unused() {}

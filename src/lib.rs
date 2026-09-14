@@ -1,9 +1,16 @@
 pub mod agents;
 pub mod cli;
+pub mod compress;
 pub mod config;
+pub mod context;
+pub mod db;
 pub mod graph;
+pub mod local;
 pub mod mcp;
 pub mod plugins;
 pub mod providers;
+pub mod router;
 pub mod telemetry;
+pub mod tokenutil;
 pub mod tui;
+pub mod verify;

@@ -12,7 +12,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 petgraph = { version = "0.6", features = ["serde-1"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 colored = "2.1"
 anyhow = "1.0"
 async-trait = "0.1"
@@ -22,6 +22,32 @@ walkdir = "2.5"
 regex = "1.10"
 ratatui = "0.28"
 crossterm = "0.28"
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "5"
+memmap2 = "0.9"
+sha2 = "0.10"
+futures-util = "0.3"
+encoding_rs = "0.8"
+llama-cpp-2 = { version = "0.1.156", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[features]
+default = []
+# Local embedded MiniCPM worker via llama.cpp (CPU). Requires cmake + C toolchain.
+local = ["dep:llama-cpp-2"]
+# Build llama.cpp with the Vulkan backend for Intel iGPU / integrated GPUs.
+# Set LLAMA_CMAKE_ARGS="-DGGML_VULKAN=ON" when building with --features vulkan.
+vulkan = ["local"]
+# Bake a GGUF into the executable: HUSK_EMBED_MODEL=/path/to/model.gguf
+embed-model = []
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
