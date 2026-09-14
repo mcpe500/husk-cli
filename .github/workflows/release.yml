@@ -38,7 +38,7 @@ jobs:
         shell: bash
         env:
           FEATURES: ${{ matrix.features }}
-        run: cargo build --release --locked $FEATURES
+        run: cargo build --release --locked ${FEATURES:+--features $FEATURES}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
