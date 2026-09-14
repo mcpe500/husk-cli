@@ -23,7 +23,7 @@ regex = "1.10"
 ratatui = "0.28"
 crossterm = "0.28"
 rusqlite = { version = "0.32", features = ["bundled"] }
-dirs = "5"
+dirs = "7"
 memmap2 = "0.9"
 sha2 = "0.10"
 futures-util = "0.3"
