@@ -16,6 +16,42 @@ Husk is a **Rust** single-binary coding agent designed around one idea:
 results, and gentle enough for an 8GB laptop that already runs a browser,
 VSCode and Docker.
 
+## Install
+
+**1. Easiest — prebuilt binary (Linux x86_64):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mcpe500/husk-cli/main/install.sh | sh
+```
+
+(Windows: grab `husk-cli-x86_64-pc-windows-msvc.zip` from the
+[Releases page](https://github.com/mcpe500/husk-cli/releases/latest).)
+
+**2. From source via cargo (cloud-only, no model build):**
+
+```bash
+cargo install --git https://github.com/mcpe500/husk-cli.git
+```
+
+**3. Full laptop build — embedded MiniCPM worker (needs cmake + C toolchain):**
+
+```bash
+# CPU only
+cargo install --git https://github.com/mcpe500/husk-cli.git --features local
+
+# + Intel iGPU offload (Vulkan)
+LLAMA_CMAKE_ARGS="-DGGML_VULKAN=ON" \
+  cargo install --git https://github.com/mcpe500/husk-cli.git --features local,vulkan
+```
+
+**Then set up the Netra Runtime key:**
+
+```bash
+husk config preset deepseek
+husk config set api_key "$NETRA_API_KEY"
+husk chat
+```
+
 ---
 
 ## Architecture

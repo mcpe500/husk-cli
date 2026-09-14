@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: ""
+            suffix: ""
+          # Embedded MiniCPM worker (llama.cpp CPU) — for the 8GB laptop.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: "local"
+            suffix: "-local"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: ""
+            suffix: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (cloud-only or --features local)
+        shell: bash
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo build --release --locked $FEATURES
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          asset="husk-cli-${{ matrix.target }}${{ matrix.suffix }}.tar.gz"
+          tar -czf "$asset" -C target/release husk-cli
+          echo "asset=$asset" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $asset = "husk-cli-${{ matrix.target }}${{ matrix.suffix }}.zip"
+          Compress-Archive -Path target/release/husk-cli.exe -DestinationPath $asset
+          "asset=$asset" | Add-Content $env:GITHUB_ENV
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.asset }}
+          generate_release_notes: true
